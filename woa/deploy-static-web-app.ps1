@@ -1,5 +1,3 @@
-#!/usr/bin/env pwsh
-
 #############################################################################
 # CONFIGURATION
 #############################################################################
@@ -9,6 +7,14 @@ $DIST_FOLDER = ".next"
 $PREVIEW_PREFIX = "preview"
 $NEXT_CACHE_DIR = ".next/cache"
 $Env:AZURE_CORE_OUTPUT_PAGER = ""  # Disable paging
+
+# Configure git to not prompt
+$env:GIT_TERMINAL_PROMPT = 0
+# Ensure git knows who we are (required for commits)
+if (-not (git config --get user.email)) {
+    git config --local user.email "azure-deployment@company.com"
+    git config --local user.name "Azure Deployment"
+}
 
 #############################################################################
 # UTILITY FUNCTIONS
@@ -48,26 +54,78 @@ function End-Timing {
 }
 
 #############################################################################
-# USAGE HELPER
+# GITHUB SETUP
 #############################################################################
-function Show-Usage {
-    Write-Host @"
-Usage:
-    $($MyInvocation.MyCommand.Name) preview [<customPreviewName>]
-        Builds your static site and deploys it to a "preview" environment,
-        either "preview-YYYYMMDD_HHMMSS" by default or a custom name if you pass one.
+function Get-GitHub-Info {
+    $gitRemote = git config --get remote.origin.url
+    if (-not $gitRemote) {
+        Print-Error "No git remote found. Please initialize git repository first."
+    }
 
-    $($MyInvocation.MyCommand.Name) promote <previewEnvironmentName>
-        Promotes (swaps) an existing preview environment to production.
+    $GITHUB_ORG = $gitRemote -replace '.*github\.com[:/]([^/]+)/.*', '$1'
+    $GITHUB_REPO = $gitRemote -replace '.*github\.com[:/][^/]+/(.*?)(.git)?$', '$1'
 
-Examples:
-    1) Deploy a new preview:
-       ./deploy-static-web-app.ps1 preview
-    2) Deploy a named preview:
-       ./deploy-static-web-app.ps1 preview my-test
-    3) Promote that environment to production:
-       ./deploy-static-web-app.ps1 promote my-test
+    return @{
+        org = $GITHUB_ORG
+        repo = $GITHUB_REPO
+    }
+}
+
+function Setup-GitHub-Repository {
+    Start-Step "Setting up GitHub repository"
+
+    $gitInfo = Get-GitHub-Info
+    $nodeVersion = (node --version).Trim('v')
+
+    # Create GitHub workflow directory
+    New-Item -Path ".github/workflows" -ItemType Directory -Force
+
+    # Create workflow file
+    $workflowContent = @"
+name: Azure Static Web Apps Deployment
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '$nodeVersion'
+      - name: Build
+        run: |
+          npm install --prefer-offline --no-audit --no-fund
+          cp -r .next/static .next/standalone/.next/
+          cp -r public .next/standalone/
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+      - name: Deploy
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: `${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          repo_token: `${{ secrets.GITHUB_TOKEN }}
+          action: "upload"
+          app_location: "/"
+          output_location: ".next"
+          skip_app_build: true
 "@
+    $workflowContent | Out-File -FilePath ".github/workflows/azure-static-web-apps.yml" -Encoding utf8 -Force
+
+    # Set deployment token in GitHub secrets
+    $deploymentToken = az staticwebapp secrets list `
+        --name $STATIC_WEB_APP_NAME `
+        --resource-group $RESOURCE_GROUP `
+        --query "properties.apiKey" -o tsv
+
+    gh secret set AZURE_STATIC_WEB_APPS_API_TOKEN --body "$deploymentToken" `
+        --repo "$($gitInfo.org)/$($gitInfo.repo)"
+
+    End-Step
 }
 
 #############################################################################
@@ -84,24 +142,16 @@ function Check-Build-Folder {
 function Build-App {
     Start-Step "Building application"
 
-    # Fast dependency check and install
-    if (-not (Test-Path "node_modules")) {
-        Write-Host "📦 Installing dependencies (node_modules missing)..."
-        npm install --prefer-offline --no-audit --no-fund
-    }
-    elseif (-not (Test-Path ".last-package-lock.json") -or
-            (-not (Compare-Object (Get-Content "package-lock.json") (Get-Content ".last-package-lock.json")))) {
-        Write-Host "📦 package-lock.json changed, updating dependencies..."
-        npm install --prefer-offline --no-audit --no-fund
-        Copy-Item "package-lock.json" ".last-package-lock.json"
-    }
-    else {
-        Write-Host "✅ Dependencies up to date, skipping install."
+    # Only clean if folder exists
+    if (Test-Path $NEXT_CACHE_DIR) {
+        Write-Host "Cleaning Next.js cache..."
+        Remove-Item -Recurse -Force $NEXT_CACHE_DIR
     }
 
-    Write-Host "🏗️  Running next build..."
+    Write-Host "Building Next.js application..."
     $Env:NEXT_TELEMETRY_DISABLED = 1
-    npx next build --no-lint
+    npm install --prefer-offline --no-audit --no-fund
+    npm run build
 
     if (-not (Test-Path $DIST_FOLDER)) {
         Print-Error "Build failed: Output folder '$DIST_FOLDER' not found after build"
@@ -116,134 +166,97 @@ function Build-App {
 function Deploy-Preview {
     param([string]$customName)
 
-    Start-Step "Validating configuration"
-    $swaConfigExists = Test-Path "swa-cli.config.json"
-    if (-not $swaConfigExists) {
-        Write-Host "Creating SWA CLI config..."
-        swa init --app-location $DIST_FOLDER
-    }
-    End-Step
+    Start-Step "Deploying to preview environment"
 
-    Check-Build-Folder
+    # Build first
+    Build-App
 
-    # Generate preview environment name
-    if ($customName) {
-        $stageName = $customName
-    }
-    else {
+    # Generate environment name if not provided
+    if (-not $customName) {
         $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-        $stageName = "${PREVIEW_PREFIX}-${timestamp}"
+        $customName = "preview-$timestamp"
     }
 
-    Start-Step "Getting deployment token"
-    $token = az staticwebapp secrets list `
+    # Force add all changes and commit
+    git add -A
+    git commit -m "Preview deployment $customName" --allow-empty
+
+    # Force push to main (non-interactive)
+    git push -f origin main
+
+    # Deploy using Azure CLI
+    az staticwebapp deployment environment create `
         --name $STATIC_WEB_APP_NAME `
         --resource-group $RESOURCE_GROUP `
-        --query "properties.apiKey" -o tsv
+        --environment-name $customName
 
-    if ([string]::IsNullOrEmpty($token)) {
-        Print-Error "Failed to retrieve deployment token. Ensure your Azure Static Web App exists."
-    }
+    # Get Static Web App URLs
+    $staticAppUrl = az staticwebapp show `
+        --name $STATIC_WEB_APP_NAME `
+        --resource-group $RESOURCE_GROUP `
+        --query "defaultHostname" -o tsv
+
+    $previewUrl = "https://$customName.$staticAppUrl"
 
     End-Step
-
-    Start-Step "Deploying to staging environment '$stageName'"
-
-    try {
-        Write-Host "Running SWA deployment command..."
-        $deploymentResult = swa deploy `
-            --app-location $DIST_FOLDER `
-            --deployment-token $token `
-            --env $stageName `
-            --verbose
-
-        Write-Host "Raw deployment output:"
-        Write-Host $deploymentResult
-
-        # Wait a moment for deployment to complete
-        Start-Sleep -Seconds 10
-
-        # Get the deployment URL from Azure
-        Write-Host "Fetching deployment URL..."
-        $deploymentUrl = az staticwebapp show `
-            --name $STATIC_WEB_APP_NAME `
-            --resource-group $RESOURCE_GROUP `
-            --query "defaultHostname" -o tsv
-
-        if ([string]::IsNullOrEmpty($deploymentUrl)) {
-            Write-Host "Failed to get deployment URL from Azure CLI"
-            Print-Error "Deployment may have failed. Check Azure portal for status."
-        }
-
-        End-Step
-
-        Print-Success "Deployment to '$stageName' complete!"
-        Write-Host "🌐 Preview URL: https://$deploymentUrl"
-        Write-Host ""
-        Write-Host "To promote this preview to production, run:"
-        Write-Host "  ./deploy-static-web-app.ps1 promote $stageName"
-    }
-    catch {
-        Write-Host "Error during deployment:"
-        Write-Host $_
-        Print-Error "Deployment failed with an error"
-    }
+    Print-Success "Preview deployment complete"
+    Write-Host "🌐 Preview URL: $previewUrl"
 }
 
-function Promote-ToProduction {
-    param([string]$previewName)
+function Deploy-Production {
+    Start-Step "Deploying to production"
 
-    if (-not $previewName) {
-        Write-Host "❌ Please specify the preview environment name you want to promote."
-        Show-Usage
-        exit 1
-    }
+    # Build first
+    Build-App
 
-    Start-Step "Promoting '$previewName' to production"
+    # Force add all changes and commit without prompting
+    git add -A
+    git commit -m "Production deployment $(Get-Date -Format 'yyyy-MM-dd HH:mm')" --allow-empty
 
-    az staticwebapp environment swap `
+    # Force push to main (non-interactive)
+    git push -f origin main
+
+    # Get Static Web App URL
+    $staticAppUrl = az staticwebapp show `
         --name $STATIC_WEB_APP_NAME `
         --resource-group $RESOURCE_GROUP `
-        --source $previewName `
-        --target "production"
+        --query "defaultHostname" -o tsv
 
     End-Step
-    Print-Success "Environment '$previewName' was promoted to production!"
+    Print-Success "Production deployment initiated"
+    Write-Host "🌐 Production URL: https://$staticAppUrl"
 }
 
 #############################################################################
-# MAIN
+# MAIN SCRIPT
 #############################################################################
-
-# Start timing the entire process
 Start-Timing
 
 # Process command line arguments
-$cmd = if ($args.Count -eq 0 -or $args[0] -eq "preview") {
-    "preview"
-} else {
-    $args[0]
-}
+$cmd = if ($args.Count -eq 0) { "production" } else { $args[0] }
 
 switch ($cmd) {
+    "setup" {
+        Setup-GitHub-Repository
+    }
     "preview" {
         $customName = if ($args.Count -gt 1) { $args[1] } else { "" }
-        Build-App
         Deploy-Preview $customName
     }
-    "promote" {
-        if ($args.Count -lt 2) {
-            Write-Host "❌ You must provide the preview environment name to promote."
-            Show-Usage
-            exit 1
-        }
-        Promote-ToProduction $args[1]
+    "production" {
+        Deploy-Production
     }
     default {
-        Show-Usage
+        Write-Host @"
+Usage:
+    $($MyInvocation.MyCommand.Name) [setup|preview|production]
+
+    setup               Setup GitHub repository and workflow
+    preview [name]      Deploy to preview environment
+    production          Deploy to production environment
+"@
         exit 1
     }
 }
 
-# End timing and show total
 End-Timing

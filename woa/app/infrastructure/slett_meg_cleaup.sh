@@ -1,42 +1,56 @@
 #!/bin/bash
-# woa/app/infrastructure/cleanup-prod.sh
+# cleanup-okta.sh
 set -e
 
-# Configuration
-RESOURCE_GROUP="abs-rg-we-prod"
-APP_NAME="woa-prod-app"
-STATIC_WEB_APP_NAME="woa-prod-spa"
+# Ensure required Okta environment variables are set.
+if [ -z "$OKTA_API_TOKEN" ] || [ -z "$OKTA_DOMAIN" ]; then
+    echo "Error: Please set OKTA_API_TOKEN and OKTA_DOMAIN environment variables."
+    echo "Example:"
+    echo "  export OKTA_API_TOKEN=\"your_okta_api_token\""
+    echo "  export OKTA_DOMAIN=\"your_okta_domain\"  # e.g., dev-123456.okta.com"
+    exit 1
+fi
 
-# Get GitHub information
-GITHUB_ORG=$(git config --get remote.origin.url | sed -n 's/.*github\.com[:/]\([^/]*\)\/.*/\1/p')
-GITHUB_REPO=$(git config --get remote.origin.url | sed -n 's/.*github\.com[:/][^/]*\/\(.*\)\.git/\1/p')
+echo "Searching for Okta integrations with label 'Azure Static Web App Auth'..."
 
-echo "🧹 Starting cleanup process..."
+# Query Okta for apps matching the label.
+APPS=$(curl -s -X GET "https://${OKTA_DOMAIN}/api/v1/apps?q=Azure%20Static%20Web%20App%20Auth" \
+  -H "Authorization: SSWS ${OKTA_API_TOKEN}" \
+  -H "Accept: application/json")
 
-# Remove GitHub Secret
-echo "Removing GitHub deployment token..."
-gh secret remove AZURE_STATIC_WEB_APPS_API_TOKEN --repo "$GITHUB_ORG/$GITHUB_REPO"
+# Filter results for those whose label exactly matches "Azure Static Web App Auth".
+APP_IDS=$(echo "$APPS" | jq -r '.[] | select(.label=="Azure Static Web App Auth") | .id')
 
-# Delete Application Insights
-echo "Deleting Application Insights..."
-az monitor app-insights component delete \
-    --app "${APP_NAME}-insights" \
-    --resource-group $RESOURCE_GROUP \
-    --yes \
-    --output none
+if [ -z "$APP_IDS" ]; then
+    echo "No Okta integrations with label 'Azure Static Web App Auth' found."
+    exit 0
+fi
 
-# Delete Static Web App
-echo "Deleting Static Web App..."
-az staticwebapp delete \
-    --name $STATIC_WEB_APP_NAME \
-    --resource-group $RESOURCE_GROUP \
-    --yes \
-    --output none
+echo "Found Okta integrations with IDs:"
+echo "$APP_IDS"
 
-echo "
-✅ Cleanup Complete! The following resources have been removed:
-----------------------------------------------------------
-- Static Web App ($STATIC_WEB_APP_NAME)
-- Application Insights (${APP_NAME}-insights)
-- GitHub Deployment Token
-"
+for APP_ID in $APP_IDS; do
+    echo "Deactivating Okta integration with ID: $APP_ID..."
+    DEACTIVATE_RESPONSE=$(curl -s -X POST "https://${OKTA_DOMAIN}/api/v1/apps/${APP_ID}/lifecycle/deactivate" \
+      -H "Authorization: SSWS ${OKTA_API_TOKEN}" \
+      -H "Accept: application/json")
+    if [ -z "$DEACTIVATE_RESPONSE" ] || [ "$DEACTIVATE_RESPONSE" = "{}" ]; then
+        echo "Integration with ID: $APP_ID deactivated successfully."
+    else
+        echo "Warning: Received response while deactivating integration with ID $APP_ID:"
+        echo "$DEACTIVATE_RESPONSE"
+    fi
+
+    echo "Deleting Okta integration with ID: $APP_ID..."
+    DELETE_RESPONSE=$(curl -s -X DELETE "https://${OKTA_DOMAIN}/api/v1/apps/${APP_ID}" \
+      -H "Authorization: SSWS ${OKTA_API_TOKEN}" \
+      -H "Accept: application/json")
+    if echo "$DELETE_RESPONSE" | grep -qi "errorCode"; then
+        echo "Error deleting integration with ID $APP_ID. Response:"
+        echo "$DELETE_RESPONSE"
+    else
+        echo "Integration with ID $APP_ID deleted successfully."
+    fi
+done
+
+echo "Okta integrations cleanup complete."
