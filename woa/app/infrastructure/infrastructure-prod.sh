@@ -1,285 +1,384 @@
 #!/bin/bash
-# infrastructure-prod.sh
+# woa/app/infrastructure/infrastructure-prod.sh
 set -e
 
-####################################
-# Pre-requisites & Environment Checks
-####################################
-# Ensure jq is installed.
-if ! command -v jq &> /dev/null; then
-  echo "Error: jq is required but not installed. Install with e.g., sudo apt-get install jq."
-  exit 1
-fi
-
-# Ensure that the Azure Static Web Apps extension is installed and updated.
-if ! az extension show --name staticwebapp &> /dev/null; then
-  echo "Azure Static Web Apps extension not found. Installing..."
-  az extension add --name staticwebapp
-else
-  echo "Updating Azure Static Web Apps extension..."
-  az extension update --name staticwebapp
-fi
-
-# Verify required Okta environment variables.
-if [ -z "$OKTA_API_TOKEN" ] || [ -z "$OKTA_DOMAIN" ]; then
-  echo "Error: Please set OKTA_API_TOKEN and OKTA_DOMAIN environment variables."
-  echo "Example:"
-  echo "  export OKTA_API_TOKEN=\"your_okta_api_token\""
-  echo "  export OKTA_DOMAIN=\"your_okta_domain\"  # e.g., dev-123456.okta.com"
-  exit 1
-fi
-
-####################################
 # Configuration
-####################################
-# Define your resource names and locations.
 RESOURCE_GROUP="abs-rg-we-prod"
 LOCATION="westeurope"
+VNET_NAME="abs-vnet-we-prod"
+PE_SUBNET="woa-private-endpoints"
 APP_NAME="woa-prod-app"
 STATIC_WEB_APP_NAME="woa-prod-spa"
 STATIC_WEB_APP_SKU="Standard"
+FRONTDOOR_NAME="woa-prod-fd"
+FRONTDOOR_ENDPOINT_NAME="woa-prod-fd-endpoint"
+FRONTDOOR_ORIGIN_GROUP="woa-prod-static-origin-group"
+FRONTDOOR_ORIGIN="woa-prod-static-origin"
 LOG_ANALYTICS_NAME="woa-prod-logs"
+RESOURCE_GROUP="abs-rg-we-prod"
+LOCATION="westeurope"
+WORKSPACE_ID="/subscriptions/367fc58b-579a-44ff-aaf6-769df039fde6/resourceGroups/abs-rg-we-prod/providers/Microsoft.OperationalInsights/workspaces/woa-prod-logs"
+RESOURCE_GROUP="abs-rg-we-prod"
+LOCATION="westeurope"
+VNET_NAME="abs-vnet-we-prod"
+PE_SUBNET="woa-private-endpoints"
+PE_NSG="abs-nsg-woa-pe-we-prod"
 
-# Retrieve GitHub information from your local git remote.
-GITHUB_TOKEN=$(gh auth token)
-GITHUB_ORG=$(git config --get remote.origin.url | sed -n 's/.*github\.com[:/]\([^/]*\)\/.*/\1/p')
-GITHUB_REPO=$(git config --get remote.origin.url | sed -n 's/.*github\.com[:/][^/]*\/\(.*\)\.git/\1/p')
 
-####################################
-# Check for Prerequisite Azure Resources
-####################################
-if ! az monitor log-analytics workspace show \
-      --resource-group "$RESOURCE_GROUP" \
-      --workspace-name "$LOG_ANALYTICS_NAME" \
-      --output none 2>/dev/null; then
-  echo "❌ Log Analytics workspace '$LOG_ANALYTICS_NAME' not found in resource group '$RESOURCE_GROUP'."
-  echo "Ensure your network infrastructure is deployed first."
-  exit 1
+# Check if Log Analytics workspace exists first
+if ! az monitor log-analytics workspace show --resource-group $RESOURCE_GROUP --workspace-name $LOG_ANALYTICS_NAME --output none 2>/dev/null; then
+    echo "❌ Log Analytics workspace not found. Please ensure network infrastructure is deployed first."
+    exit 1
 fi
 
-####################################
+#############################################
+# 1. Create NSG for the Private Endpoint Subnet
+#############################################
+echo "Configuring rules for NSG '$PE_NSG'..."
+# Allow VNet traffic with priority 100
+az network nsg rule create \
+    --nsg-name $PE_NSG \
+    --resource-group $RESOURCE_GROUP \
+    --name AllowVNetTraffic \
+    --priority 100 \
+    --direction Inbound \
+    --access Allow \
+    --protocol "*" \
+    --source-address-prefixes VirtualNetwork \
+    --destination-address-prefixes VirtualNetwork \
+    --destination-port-ranges "*" \
+    --output none
+
+# Allow Private Endpoints with priority 110
+az network nsg rule create \
+    --nsg-name $PE_NSG \
+    --resource-group $RESOURCE_GROUP \
+    --name AllowPrivateEndpointsTraffic \
+    --priority 110 \
+    --direction Inbound \
+    --access Allow \
+    --protocol "*" \
+    --source-address-prefixes VirtualNetwork \
+    --destination-address-prefixes "*" \
+    --destination-port-ranges "*" \
+    --output none
+
+# Deny all inbound traffic by default (company policy)
+az network nsg rule create \
+    --nsg-name $PE_NSG \
+    --resource-group $RESOURCE_GROUP \
+    --name DenyAllInbound \
+    --priority 4096 \
+    --direction Inbound \
+    --access Deny \
+    --protocol "*" \
+    --source-address-prefixes "*" \
+    --destination-address-prefixes "*" \
+    --destination-port-ranges "*" \
+    --output none
+
+#############################################
+# 2. Associate NSG with Private Endpoint Subnet
+#############################################
+echo "Associating NSG '$PE_NSG' with subnet '$PE_SUBNET'..."
+az network vnet subnet update \
+    --name $PE_SUBNET \
+    --vnet-name $VNET_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --network-security-group $PE_NSG \
+    --output none
+
+
+
+#############################################
 # Create Application Insights
-####################################
+#############################################
 echo "Creating Application Insights..."
 az monitor app-insights component create \
-  --app "${APP_NAME}-insights" \
-  --location "$LOCATION" \
-  --resource-group "$RESOURCE_GROUP" \
-  --workspace "$LOG_ANALYTICS_NAME" \
-  --kind web \
-  --application-type web \
-  --output none
-
-####################################
-# Create or Update Static Web App with GitHub Integration
-####################################
-echo "Checking for existing Static Web App..."
-if az staticwebapp show --name "$STATIC_WEB_APP_NAME" --resource-group "$RESOURCE_GROUP" --output none 2>/dev/null; then
-  echo "Static Web App '$STATIC_WEB_APP_NAME' already exists in resource group '$RESOURCE_GROUP'. Skipping creation."
-else
-  echo "Creating Static Web App..."
-  az staticwebapp create \
-    --name "$STATIC_WEB_APP_NAME" \
-    --resource-group "$RESOURCE_GROUP" \
-    --location "$LOCATION" \
-    --sku "$STATIC_WEB_APP_SKU" \
-    --source "https://github.com/$GITHUB_ORG/$GITHUB_REPO" \
-    --branch "main" \
-    --token "$GITHUB_TOKEN" \
+    --app "${APP_NAME}-insights" \
+    --location $LOCATION \
+    --resource-group $RESOURCE_GROUP \
+    --workspace $LOG_ANALYTICS_NAME \
+    --kind web \
+    --application-type web \
     --output none
-fi
 
-####################################
-# Enable Enterprise-grade Edge
-####################################
-echo "Enabling Enterprise-grade Edge..."
-az staticwebapp enterprise-edge enable \
-  --name "$STATIC_WEB_APP_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --output none || echo "Enterprise-grade Edge already enabled or conflict occurred."
+#############################################
+# Create Static Web App with Okta Auth Config
+#############################################
+echo "Creating/Updating Static Web App..."
+az staticwebapp create \
+    --name $STATIC_WEB_APP_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --location $LOCATION \
+    --sku $STATIC_WEB_APP_SKU \
+    --output none
 
-####################################
-# Retrieve Static Web App Hostname
-####################################
-echo "Retrieving Static Web App hostname..."
-STATIC_WEB_APP_HOSTNAME=$(az staticwebapp show \
-  --name "$STATIC_WEB_APP_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --query "defaultHostname" \
-  --output tsv)
-echo "Static Web App Hostname: $STATIC_WEB_APP_HOSTNAME"
+# Configure auth settings
+echo "Configuring authorization settings..."
+az staticwebapp update \
+    --name $STATIC_WEB_APP_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --auth-provider-enabled true \
+    --output none
 
-####################################
-# Create or Recreate Okta OIDC Application Integration
-####################################
-# If OKTA_CLIENT_SECRET is not provided, then force recreate the integration to capture a new secret.
-if [ -z "$OKTA_CLIENT_SECRET" ]; then
-  echo "OKTA_CLIENT_SECRET not set. Forcing recreation of Okta integration..."
-  # Query for any existing integration with the desired label.
-  EXISTING_OKTA=$(curl -s -X GET "https://${OKTA_DOMAIN}/api/v1/apps?q=Azure%20Static%20Web%20App%20Auth" \
-    -H "Authorization: SSWS ${OKTA_API_TOKEN}" \
-    -H "Accept: application/json")
-  EXISTING_COUNT=$(echo "$EXISTING_OKTA" | jq 'length')
-  if [ "$EXISTING_COUNT" -gt 0 ]; then
-    echo "Existing Okta integrations found. Deleting them to force recreation..."
-    # Loop over all found integrations and delete them (after deactivating if necessary).
-    for APP_ID in $(echo "$EXISTING_OKTA" | jq -r '.[].id'); do
-      echo "Deactivating integration $APP_ID..."
-      curl -s -X POST "https://${OKTA_DOMAIN}/api/v1/apps/${APP_ID}/lifecycle/deactivate" \
-        -H "Authorization: SSWS ${OKTA_API_TOKEN}" \
-        -H "Accept: application/json" > /dev/null
-      echo "Deleting integration $APP_ID..."
-      curl -s -X DELETE "https://${OKTA_DOMAIN}/api/v1/apps/${APP_ID}" \
-        -H "Authorization: SSWS ${OKTA_API_TOKEN}" \
-        -H "Accept: application/json" > /dev/null
-      echo "Deleted integration $APP_ID."
-    done
-  fi
-  echo "Creating new Okta OIDC integration..."
-  OKTA_PAYLOAD=$(cat <<EOF
-{
-  "name": "oidc_client",
-  "label": "Azure Static Web App Auth",
-  "signOnMode": "OPENID_CONNECT",
-  "credentials": {
-    "oauthClient": {
-      "autoKeyRotation": true,
-      "token_endpoint_auth_method": "client_secret_post"
-    }
-  },
-  "settings": {
-    "oauthClient": {
-      "redirect_uris": [
-        "https://${STATIC_WEB_APP_HOSTNAME}/.auth/login/okta/callback"
-      ],
-      "response_types": [
-        "code"
-      ],
-      "grant_types": [
-        "authorization_code"
-      ],
-      "application_type": "web"
-    }
-  }
-}
-EOF
-)
-  OKTA_RESPONSE=$(curl -s -X POST "https://${OKTA_DOMAIN}/api/v1/apps" \
-    -H "Authorization: SSWS ${OKTA_API_TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d "$OKTA_PAYLOAD")
-  OKTA_CLIENT_ID=$(echo "$OKTA_RESPONSE" | jq -r '.credentials.oauthClient.client_id')
-  OKTA_CLIENT_SECRET=$(echo "$OKTA_RESPONSE" | jq -r '.credentials.oauthClient.client_secret')
-  if [ "$OKTA_CLIENT_ID" = "null" ] || [ "$OKTA_CLIENT_SECRET" = "null" ]; then
-    echo "Error creating Okta integration. Response:"
-    echo "$OKTA_RESPONSE"
-    exit 1
-  fi
-  echo "Okta integration created successfully."
-  echo "Okta Client ID: $OKTA_CLIENT_ID"
-  echo "Okta Client Secret: $OKTA_CLIENT_SECRET"
-else
-  echo "Using existing Okta integration from environment variables."
-fi
-
-####################################
-# Generate staticwebapp.config.json
-####################################
-echo "Generating staticwebapp.config.json with custom authentication settings..."
-CONFIG_FILE="staticwebapp.config.json"
-cat <<EOF > $CONFIG_FILE
-{
-  "routes": [
-    {
-      "route": "/*",
-      "allowedRoles": ["authenticated"]
-    }
-  ],
-  "auth": {
-    "identityProviders": {
-      "customOpenIdConnectProviders": {
-        "okta": {
-          "registration": {
-            "clientIdSettingName": "OKTA_CLIENT_ID",
-            "clientCredential": {
-              "clientSecretSettingName": "OKTA_CLIENT_SECRET"
-            },
-            "openIdConnectConfiguration": {
-              "wellKnownOpenIdConfiguration": "https://${OKTA_DOMAIN}/.well-known/openid-configuration"
-            }
-          },
-          "login": {
-            "nameClaimType": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"
-          }
+# Add default routes configuration for auth
+ROUTES_CONFIG='{
+    "routes": [
+        {
+            "route": "/*",
+            "allowedRoles": ["authenticated"]
         }
-      }
+    ],
+    "auth": {
+        "identityProviders": {
+            "customOpenIdConnect": {
+                "enabled": true,
+                "registration": {
+                    "clientId": "OKTA_CLIENT_ID",
+                    "clientSecret": "OKTA_CLIENT_SECRET",
+                    "openIdConnectConfiguration": {
+                        "authorizationEndpoint": "https://YOUR_DEV_OKTA_DOMAIN/oauth2/v1/authorize",
+                        "tokenEndpoint": "https://YOUR_DEV_OKTA_DOMAIN/oauth2/v1/token",
+                        "issuer": "https://YOUR_DEV_OKTA_DOMAIN",
+                        "clientCredentialAuthenticationScheme": "header"
+                    }
+                }
+            }
+        }
     }
-  }
-}
-EOF
+}'
 
-####################################
-# Auto-commit All Local Files and Force Push to main
-####################################
-echo "Auto-committing all local changes..."
-git add -A
-if ! git diff-index --quiet HEAD; then
-  git commit -m "Auto commit from infra script"
+echo "Updating routes configuration for authentication..."
+az staticwebapp config set \
+    --name $STATIC_WEB_APP_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --config "$ROUTES_CONFIG" \
+    --output none
+
+
+#############################################
+# Create Front Door Profile and Endpoint
+#############################################
+echo "Creating Front Door profile..."
+az afd profile create \
+    --profile-name $FRONTDOOR_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --sku Standard_AzureFrontDoor \
+    --output none
+
+echo "Creating Front Door endpoint..."
+az afd endpoint create \
+    --endpoint-name $FRONTDOOR_ENDPOINT_NAME \
+    --profile-name $FRONTDOOR_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --enabled-state Enabled \
+    --output none
+
+#############################################
+# Create Origin Group and Origin
+#############################################
+echo "Creating Front Door origin group..."
+az afd origin-group create \
+    --origin-group-name $FRONTDOOR_ORIGIN_GROUP \
+    --profile-name $FRONTDOOR_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --probe-path "/" \
+    --probe-protocol Https \
+    --probe-request-type HEAD \
+    --probe-interval-in-seconds 120 \
+    --sample-size 4 \
+    --successful-samples-required 3 \
+    --additional-latency-in-milliseconds 50 \
+    --output none
+
+echo "Creating Front Door origin..."
+STATIC_WEB_APP_HOSTNAME=$(az staticwebapp show \
+    --name $STATIC_WEB_APP_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --query "defaultHostname" \
+    --output tsv)
+
+az afd origin create \
+    --origin-name $FRONTDOOR_ORIGIN \
+    --profile-name $FRONTDOOR_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --origin-group-name $FRONTDOOR_ORIGIN_GROUP \
+    --host-name $STATIC_WEB_APP_HOSTNAME \
+    --origin-host-header $STATIC_WEB_APP_HOSTNAME \
+    --priority 1 \
+    --weight 1000 \
+    --enabled-state Enabled \
+    --http-port 80 \
+    --https-port 443 \
+    --enforce-certificate-name-check true \
+    --output none
+
+#############################################
+# Create Rule Set and Security Headers
+#############################################
+echo "Creating rule set for security headers..."
+az afd rule-set create \
+    --profile-name $FRONTDOOR_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --rule-set-name "securityheaders" \
+    --output none
+
+echo "Adding HSTS security header rule..."
+az afd rule create \
+    --rule-set-name "securityheaders" \
+    --profile-name $FRONTDOOR_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --order 1 \
+    --rule-name "hsts" \
+    --action-name "ModifyResponseHeader" \
+    --header-action "Append" \
+    --header-name "Strict-Transport-Security" \
+    --header-value "max-age=31536000" \
+    --output none
+
+echo "Adding X-Content-Type-Options security header rule..."
+az afd rule create \
+    --rule-set-name "securityheaders" \
+    --profile-name $FRONTDOOR_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --order 2 \
+    --rule-name "nosniff" \
+    --action-name "ModifyResponseHeader" \
+    --header-action "Append" \
+    --header-name "X-Content-Type-Options" \
+    --header-value "nosniff" \
+    --output none
+
+echo "Adding X-Frame-Options security header rule..."
+az afd rule create \
+    --rule-set-name "securityheaders" \
+    --profile-name $FRONTDOOR_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --order 3 \
+    --rule-name "framedenied" \
+    --action-name "ModifyResponseHeader" \
+    --header-action "Append" \
+    --header-name "X-Frame-Options" \
+    --header-value "DENY" \
+    --output none
+
+#############################################
+# Create Route with Rule Set
+#############################################
+echo "Checking if Front Door route exists..."
+if ! az afd route show \
+    --route-name "defaultroute" \
+    --profile-name $FRONTDOOR_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --endpoint-name $FRONTDOOR_ENDPOINT_NAME \
+    --output none 2>/dev/null; then
+    echo "Creating Front Door route..."
+    az afd route create \
+        --route-name "defaultroute" \
+        --profile-name $FRONTDOOR_NAME \
+        --resource-group $RESOURCE_GROUP \
+        --endpoint-name $FRONTDOOR_ENDPOINT_NAME \
+        --origin-group $FRONTDOOR_ORIGIN_GROUP \
+        --supported-protocols Https \
+        --patterns-to-match "/*" \
+        --forwarding-protocol HttpsOnly \
+        --https-redirect Enabled \
+        --link-to-default-domain Enabled \
+        --rule-sets "securityheaders" \
+        --output none
+else
+    echo "✓ Front Door route already exists"
 fi
-echo "Pulling latest changes (using rebase and autostash)..."
-git pull --rebase --autostash || true
-echo "Force pushing local changes to main..."
-git push --force
 
-####################################
-# Configure Diagnostics (Monitoring)
-####################################
+#############################################
+# Configure Monitoring
+#############################################
+#!/bin/bash
+# Replace the Static Web App diagnostics section with:
+
 echo "Configuring Static Web App diagnostics..."
 STATIC_WEB_APP_ID=$(az staticwebapp show \
-  --name "$STATIC_WEB_APP_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --query id -o tsv)
+    --name $STATIC_WEB_APP_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --query id -o tsv)
+
 WORKSPACE_ID=$(az monitor log-analytics workspace show \
-  --resource-group "$RESOURCE_GROUP" \
-  --workspace-name "$LOG_ANALYTICS_NAME" \
-  --query id -o tsv)
+    --resource-group $RESOURCE_GROUP \
+    --workspace-name $LOG_ANALYTICS_NAME \
+    --query id -o tsv)
+
 az monitor diagnostic-settings create \
-  --name "${STATIC_WEB_APP_NAME}-diagnostics" \
-  --resource "$STATIC_WEB_APP_ID" \
-  --workspace "$WORKSPACE_ID" \
-  --metrics '[{"category": "AllMetrics","enabled": true,"retentionPolicy": {"days": 0,"enabled": false}}]' \
-  --output none
+    --name "${STATIC_WEB_APP_NAME}-diagnostics" \
+    --resource $STATIC_WEB_APP_ID \
+    --workspace $WORKSPACE_ID \
+    --metrics '[
+        {
+            "category": "AllMetrics",
+            "enabled": true,
+            "retentionPolicy": {
+                "days": 0,
+                "enabled": false
+            }
+        }
+    ]' \
+    --output none
 
-####################################
-# Set GitHub Deployment Token
-####################################
-echo "Setting up GitHub deployment token..."
-DEPLOYMENT_TOKEN=$(az staticwebapp secrets list \
-  --name "$STATIC_WEB_APP_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --query "properties.apiKey" -o tsv)
-gh secret set AZURE_STATIC_WEB_APPS_API_TOKEN --body "$DEPLOYMENT_TOKEN" \
-  --repo "$GITHUB_ORG/$GITHUB_REPO"
+echo "Configuring Front Door diagnostics..."
+FRONTDOOR_ID=$(az afd profile show \
+    --profile-name $FRONTDOOR_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --query id -o tsv)
 
-####################################
+az monitor diagnostic-settings create \
+    --name "${FRONTDOOR_NAME}-diagnostics" \
+    --resource $FRONTDOOR_ID \
+    --workspace $WORKSPACE_ID \
+    --logs '[
+        {
+            "category": "FrontDoorAccessLog",
+            "enabled": true
+        },
+        {
+            "category": "FrontDoorHealthProbeLog",
+            "enabled": true
+        },
+        {
+            "category": "FrontDoorWebApplicationFirewallLog",
+            "enabled": true
+        }
+    ]' \
+    --metrics '[{
+        "category": "AllMetrics",
+        "enabled": true,
+        "retentionPolicy": {
+            "enabled": false,
+            "days": 0
+        }
+    }]' \
+    --output none
+
+#############################################
 # Output Important Information
-####################################
-echo "Retrieving deployment information..."
-STATIC_WEB_APP_HOSTNAME=$(az staticwebapp show \
-  --name "$STATIC_WEB_APP_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --query "defaultHostname" \
-  --output tsv)
+#############################################
+echo "Getting deployment information..."
+FRONTDOOR_ENDPOINT=$(az afd endpoint show \
+    --endpoint-name $FRONTDOOR_ENDPOINT_NAME \
+    --profile-name $FRONTDOOR_NAME \
+    --resource-group $RESOURCE_GROUP \
+    --query "hostName" \
+    --output tsv)
+
 APPINSIGHTS_KEY=$(az monitor app-insights component show \
-  --app "${APP_NAME}-insights" \
-  --resource-group "$RESOURCE_GROUP" \
-  --query "instrumentationKey" \
-  --output tsv)
+    --app "${APP_NAME}-insights" \
+    --resource-group $RESOURCE_GROUP \
+    --query "instrumentationKey" \
+    --output tsv)
 
 echo "
 ✅ Deployment Complete! Important endpoints:
 ----------------------------------------
 🌐 Static Web App: https://${STATIC_WEB_APP_HOSTNAME}
+🚀 Front Door Endpoint: https://$FRONTDOOR_ENDPOINT
 🔑 Application Insights Key: $APPINSIGHTS_KEY
-🌟 GitHub Repo: https://github.com/$GITHUB_ORG/$GITHUB_REPO (Branch: main)
 "

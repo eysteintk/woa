@@ -1,3 +1,22 @@
+#!/usr/bin/env pwsh
+<#
+.SYNOPSIS
+  Deploys your Next.js/TypeScript SPA to Azure Static Web Apps,
+  auto-builds the app, and then auto-commits all local files (assumed to be truth) to GitHub.
+
+  It also obtains a deployment token from Azure SWA, deploys to a preview environment,
+  and outputs the deployment URL.
+
+  Additionally, it supports promoting a preview environment to production.
+
+.NOTES
+  Ensure you’re logged in to Azure (az login) and GitHub (gh auth login).
+  Make sure that your repository contains a valid GitHub Action workflow file (in .github/workflows)
+  and that your local files are always correct.
+
+  Also ensure you have installed Node.js, Next.js, and jq.
+#>
+
 #############################################################################
 # CONFIGURATION
 #############################################################################
@@ -8,13 +27,8 @@ $PREVIEW_PREFIX = "preview"
 $NEXT_CACHE_DIR = ".next/cache"
 $Env:AZURE_CORE_OUTPUT_PAGER = ""  # Disable paging
 
-# Configure git to not prompt
-$env:GIT_TERMINAL_PROMPT = 0
-# Ensure git knows who we are (required for commits)
-if (-not (git config --get user.email)) {
-    git config --local user.email "azure-deployment@company.com"
-    git config --local user.name "Azure Deployment"
-}
+# Ensure output encoding is UTF8 so emojis show correctly
+$OutputEncoding = [System.Text.UTF8Encoding]::new()
 
 #############################################################################
 # UTILITY FUNCTIONS
@@ -54,78 +68,38 @@ function End-Timing {
 }
 
 #############################################################################
-# GITHUB SETUP
+# AUTO-COMMIT AND PUSH FUNCTIONS
 #############################################################################
-function Get-GitHub-Info {
-    $gitRemote = git config --get remote.origin.url
-    if (-not $gitRemote) {
-        Print-Error "No git remote found. Please initialize git repository first."
+function Commit-AndPush {
+    Write-Host "🔄 Auto-committing all local changes..."
+    # Add all changes
+    git add -A
+    # Check if there are changes to commit
+    git diff-index --quiet HEAD
+    if ($LASTEXITCODE -ne 0) {
+        git commit -m "Auto commit from deploy script"
+    } else {
+        Write-Host "✅ No changes to commit."
     }
-
-    $GITHUB_ORG = $gitRemote -replace '.*github\.com[:/]([^/]+)/.*', '$1'
-    $GITHUB_REPO = $gitRemote -replace '.*github\.com[:/][^/]+/(.*?)(.git)?$', '$1'
-
-    return @{
-        org = $GITHUB_ORG
-        repo = $GITHUB_REPO
-    }
+    Write-Host "🔄 Pulling latest changes with rebase and autostash..."
+    git pull --rebase --autostash
+    Write-Host "🔄 Force pushing local changes to main..."
+    git push --force
 }
 
-function Setup-GitHub-Repository {
-    Start-Step "Setting up GitHub repository"
+#############################################################################
+# USAGE HELPER
+#############################################################################
+function Show-Usage {
+    Write-Host @"
+Usage:
+    $($MyInvocation.MyCommand.Name) preview [<customPreviewName>]
+        Builds your static site and deploys it to a "preview" environment,
+        either "preview-YYYYMMDD_HHMMSS" by default or a custom name if you pass one.
 
-    $gitInfo = Get-GitHub-Info
-    $nodeVersion = (node --version).Trim('v')
-
-    # Create GitHub workflow directory
-    New-Item -Path ".github/workflows" -ItemType Directory -Force
-
-    # Create workflow file
-    $workflowContent = @"
-name: Azure Static Web Apps Deployment
-on:
-  push:
-    branches: [ main ]
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    name: Deploy
-    steps:
-      - uses: actions/checkout@v3
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: '$nodeVersion'
-      - name: Build
-        run: |
-          npm install --prefer-offline --no-audit --no-fund
-          cp -r .next/static .next/standalone/.next/
-          cp -r public .next/standalone/
-        env:
-          NEXT_TELEMETRY_DISABLED: 1
-      - name: Deploy
-        uses: Azure/static-web-apps-deploy@v1
-        with:
-          azure_static_web_apps_api_token: `${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
-          repo_token: `${{ secrets.GITHUB_TOKEN }}
-          action: "upload"
-          app_location: "/"
-          output_location: ".next"
-          skip_app_build: true
+    $($MyInvocation.MyCommand.Name) promote <previewEnvironmentName>
+        Promotes (swaps) an existing preview environment to production.
 "@
-    $workflowContent | Out-File -FilePath ".github/workflows/azure-static-web-apps.yml" -Encoding utf8 -Force
-
-    # Set deployment token in GitHub secrets
-    $deploymentToken = az staticwebapp secrets list `
-        --name $STATIC_WEB_APP_NAME `
-        --resource-group $RESOURCE_GROUP `
-        --query "properties.apiKey" -o tsv
-
-    gh secret set AZURE_STATIC_WEB_APPS_API_TOKEN --body "$deploymentToken" `
-        --repo "$($gitInfo.org)/$($gitInfo.repo)"
-
-    End-Step
 }
 
 #############################################################################
@@ -142,21 +116,28 @@ function Check-Build-Folder {
 function Build-App {
     Start-Step "Building application"
 
-    # Only clean if folder exists
-    if (Test-Path $NEXT_CACHE_DIR) {
-        Write-Host "Cleaning Next.js cache..."
-        Remove-Item -Recurse -Force $NEXT_CACHE_DIR
+    # Check for node_modules; install if missing or if package-lock changed.
+    if (-not (Test-Path "node_modules")) {
+        Write-Host "📦 Installing dependencies (node_modules missing)..."
+        npm install --prefer-offline --no-audit --no-fund
+    }
+    elseif (-not (Test-Path ".last-package-lock.json") -or
+            (-not (Compare-Object (Get-Content "package-lock.json") (Get-Content ".last-package-lock.json")))) {
+        Write-Host "📦 package-lock.json changed, updating dependencies..."
+        npm install --prefer-offline --no-audit --no-fund
+        Copy-Item "package-lock.json" ".last-package-lock.json" -Force
+    }
+    else {
+        Write-Host "✅ Dependencies up to date, skipping install."
     }
 
-    Write-Host "Building Next.js application..."
+    Write-Host "🏗️  Running next build..."
     $Env:NEXT_TELEMETRY_DISABLED = 1
-    npm install --prefer-offline --no-audit --no-fund
-    npm run build
+    npx next build --no-lint
 
     if (-not (Test-Path $DIST_FOLDER)) {
         Print-Error "Build failed: Output folder '$DIST_FOLDER' not found after build"
     }
-
     End-Step
 }
 
@@ -166,97 +147,137 @@ function Build-App {
 function Deploy-Preview {
     param([string]$customName)
 
-    Start-Step "Deploying to preview environment"
+    Start-Step "Validating configuration"
+    $swaConfigExists = Test-Path "swa-cli.config.json"
+    if (-not $swaConfigExists) {
+        Write-Host "Creating SWA CLI config..."
+        swa init --app-location $DIST_FOLDER
+    }
+    End-Step
 
-    # Build first
-    Build-App
+    Check-Build-Folder
 
-    # Generate environment name if not provided
-    if (-not $customName) {
+    # Generate preview environment name
+    if ($customName) {
+        $stageName = $customName
+    }
+    else {
         $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-        $customName = "preview-$timestamp"
+        $stageName = "${PREVIEW_PREFIX}-${timestamp}"
     }
 
-    # Force add all changes and commit
-    git add -A
-    git commit -m "Preview deployment $customName" --allow-empty
-
-    # Force push to main (non-interactive)
-    git push -f origin main
-
-    # Deploy using Azure CLI
-    az staticwebapp deployment environment create `
+    Start-Step "Getting deployment token"
+    $token = az staticwebapp secrets list `
         --name $STATIC_WEB_APP_NAME `
         --resource-group $RESOURCE_GROUP `
-        --environment-name $customName
+        --query "properties.apiKey" -o tsv
 
-    # Get Static Web App URLs
-    $staticAppUrl = az staticwebapp show `
-        --name $STATIC_WEB_APP_NAME `
-        --resource-group $RESOURCE_GROUP `
-        --query "defaultHostname" -o tsv
-
-    $previewUrl = "https://$customName.$staticAppUrl"
-
+    if ([string]::IsNullOrEmpty($token)) {
+        Print-Error "Failed to retrieve deployment token. Ensure your Azure Static Web App exists."
+    }
     End-Step
-    Print-Success "Preview deployment complete"
-    Write-Host "🌐 Preview URL: $previewUrl"
+
+    Start-Step "Deploying to staging environment '$stageName'"
+    try {
+        Write-Host "Running SWA deployment command..."
+        $deploymentResult = swa deploy `
+            --app-location $DIST_FOLDER `
+            --deployment-token $token `
+            --env $stageName `
+            --verbose
+
+        Write-Host "Raw deployment output:"
+        Write-Host $deploymentResult
+
+        Start-Sleep -Seconds 10
+
+        Write-Host "Fetching deployment URL..."
+        $deploymentUrl = az staticwebapp show `
+            --name $STATIC_WEB_APP_NAME `
+            --resource-group $RESOURCE_GROUP `
+            --query "defaultHostname" -o tsv
+
+        if ([string]::IsNullOrEmpty($deploymentUrl)) {
+            Print-Error "Deployment may have failed. Check Azure portal for status."
+        }
+        End-Step
+
+        Print-Success "Deployment to '$stageName' complete!"
+        Write-Host "🌐 Preview URL: https://$deploymentUrl"
+        Write-Host ""
+        Write-Host "To promote this preview to production, run:"
+        Write-Host "  ./deploy-static-web-app.ps1 promote $stageName"
+    }
+    catch {
+        Write-Host "Error during deployment:"
+        Write-Host $_
+        Print-Error "Deployment failed with an error"
+    }
 }
 
-function Deploy-Production {
-    Start-Step "Deploying to production"
+function Promote-ToProduction {
+    param([string]$previewName)
 
-    # Build first
-    Build-App
+    if (-not $previewName) {
+        Write-Host "❌ Please specify the preview environment name you want to promote."
+        Show-Usage
+        exit 1
+    }
 
-    # Force add all changes and commit without prompting
-    git add -A
-    git commit -m "Production deployment $(Get-Date -Format 'yyyy-MM-dd HH:mm')" --allow-empty
-
-    # Force push to main (non-interactive)
-    git push -f origin main
-
-    # Get Static Web App URL
-    $staticAppUrl = az staticwebapp show `
+    Start-Step "Promoting '$previewName' to production"
+    az staticwebapp environment swap `
         --name $STATIC_WEB_APP_NAME `
         --resource-group $RESOURCE_GROUP `
-        --query "defaultHostname" -o tsv
-
+        --source $previewName `
+        --target "production"
     End-Step
-    Print-Success "Production deployment initiated"
-    Write-Host "🌐 Production URL: https://$staticAppUrl"
+    Print-Success "Environment '$previewName' promoted to production!"
 }
 
 #############################################################################
-# MAIN SCRIPT
+# MAIN
 #############################################################################
 Start-Timing
 
 # Process command line arguments
-$cmd = if ($args.Count -eq 0) { "production" } else { $args[0] }
+$cmd = if ($args.Count -eq 0 -or $args[0] -eq "preview") {
+    "preview"
+} else {
+    $args[0]
+}
 
 switch ($cmd) {
-    "setup" {
-        Setup-GitHub-Repository
-    }
     "preview" {
         $customName = if ($args.Count -gt 1) { $args[1] } else { "" }
+        Build-App
         Deploy-Preview $customName
     }
-    "production" {
-        Deploy-Production
+    "promote" {
+        if ($args.Count -lt 2) {
+            Write-Host "❌ You must provide the preview environment name to promote."
+            Show-Usage
+            exit 1
+        }
+        Promote-ToProduction $args[1]
     }
     default {
-        Write-Host @"
-Usage:
-    $($MyInvocation.MyCommand.Name) [setup|preview|production]
-
-    setup               Setup GitHub repository and workflow
-    preview [name]      Deploy to preview environment
-    production          Deploy to production environment
-"@
+        Show-Usage
         exit 1
     }
 }
+
+# Auto-commit all local changes and force-push to main
+Write-Host "`n🔄 Auto-committing all local changes..."
+git add -A
+git diff-index --quiet HEAD
+if ($LASTEXITCODE -ne 0) {
+    git commit -m "Auto commit from deploy script"
+} else {
+    Write-Host "✅ No changes to commit."
+}
+Write-Host "🔄 Pulling latest changes with rebase and autostash..."
+git pull --rebase --autostash | Out-Null
+Write-Host "🔄 Force pushing local changes to main..."
+git push --force
 
 End-Timing
