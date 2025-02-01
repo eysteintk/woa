@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package markdown;
+
+message MarkdownMessage {
+  string type = 1;       // "markdown_content"
+  string filename = 2;
+  string content = 3;
+}

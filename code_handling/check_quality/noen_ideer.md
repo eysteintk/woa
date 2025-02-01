@@ -1,0 +1,2 @@
+- istedenfor hardkode interaksjoner fra agent 1 til agent 2, bruk agent 2 til å spørre llm om hva som mangler eller be om forbedringer, og så sende dette som en prompt til agent 3.
+- dvs, vi trenger alltid en kritisk 3dje parts agent, det er jo egentlig meg da, i agent form

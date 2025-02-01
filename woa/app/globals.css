@@ -1,0 +1,28 @@
+:root {
+  --bg-color: #fafafa;
+  --text-color: #333;
+  --font-family: 'Fira Code', monospace;
+  --font-size: 14px;
+}
+
+.dark {
+  --bg-color: #111;
+  --text-color: #eee;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden; /* No scrolling */
+  height: 100%;
+  font-family: var(--font-family);
+  font-size: var(--font-size);
+  color: var(--text-color);
+  background: var(--bg-color);
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
